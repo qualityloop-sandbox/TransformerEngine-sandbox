@@ -753,6 +753,11 @@ def test_cp_with_fused_attention(
 
 
 @pytest.mark.skipif(
+    IS_HIP_EXTENSION,
+    reason="THD + all_gather CP fused attention is unsupported on ROCm (CK lacks the FA3"
+    " seqused_k path).",
+)
+@pytest.mark.skipif(
     not IS_HIP_EXTENSION and get_cudnn_version() < (8, 9, 7), reason="cuDNN 8.9.7+ is required."
 )
 @pytest.mark.skipif(
@@ -761,11 +766,6 @@ def test_cp_with_fused_attention(
 )
 def test_cp_with_fused_attention_no_load_balance(cp_pool):
     """Check experimental single-chunk forward/backward."""
-    if IS_HIP_EXTENSION:
-        pytest.skip(
-            "THD + all_gather CP fused attention is unsupported on ROCm (CK lacks the FA3"
-            " seqused_k path)."
-        )
     config = copy.deepcopy(model_configs_fused_attn["cp_2_0"])
     config.context_parallel = True
     config.cp_comm_type = "all_gather"
