@@ -19,6 +19,21 @@ function(te_rocm_rpath out_var)
     foreach(_lib IN LISTS _core)
       list(APPEND _rpaths "${_origin_to_site}/${_lib}")
     endforeach()
+    # rocm-sdk under a different interpreter below the same root as TE.
+    foreach(_minor RANGE 9 15)
+      foreach(_lib IN LISTS _core)
+        list(APPEND _rpaths
+             "${_origin_to_site}/../../python3.${_minor}/dist-packages/${_lib}")
+      endforeach()
+    endforeach()
+  endforeach()
+
+  # TE in a venv with rocm-sdk in the system interpreter.
+  foreach(_minor RANGE 9 15)
+    foreach(_lib IN LISTS _core)
+      list(APPEND _rpaths
+           "/usr/local/lib/python3.${_minor}/dist-packages/${_lib}")
+    endforeach()
   endforeach()
 
   if(TE_ROCM_PURELIB)

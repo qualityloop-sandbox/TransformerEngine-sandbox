@@ -34,8 +34,7 @@ on:
       # The arch-less amdrocm-core-devel10.0 pulls every GPU family (gfx908..gfx1250, ~7.3 GB), 
       # while amdrocm-core-devel10.0-gfx950 pulls only gfx950 (~2.0 GB).
       rocm_devel_package:
-        description: 'ROCm devel package installed in the Docker image. Must match the ROCm version of the test images in ci/ci_config.json.'
-        type: string
+        description: 'ROCm devel package installed in the Docker image.'
         required: true
         default: 'amdrocm-core-devel10.0-gfx950'
       force_build_image:
