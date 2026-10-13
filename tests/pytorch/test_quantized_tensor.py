@@ -622,6 +622,58 @@ class TestQuantizedTensor:
         torch.testing.assert_close(dx_test, dx_ref, **tols)
 
     @pytest.mark.parametrize("quantization", _quantization_list)
+    def test_reshape(
+        self,
+        *,
+        quantization: str,
+        in_shape: Iterable[int] = (128, 128),
+        out_shape: Iterable[int] = (2, 64, 128),
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        """Test reshaping a QuantizedTensor to a genuinely different shape.
+
+        Unlike the identity case exercised by ``test_identity_op``
+        (where the output shape equals the input shape), this splits
+        the outer dimension into two, leaving the last dimension
+        unchanged so the reshape is valid for every quantization
+        scheme under test. Checks both the reshaped values and
+        gradient propagation through ``_ReshapeFunc``.
+
+        """
+
+        # Create reference and quantized tensor
+        x_ref, x_test = make_reference_and_test_tensors(
+            shape=in_shape,
+            quantization=quantization,
+            test_dtype=dtype,
+        )
+        dy_ref, dy_test = make_reference_and_test_tensors(
+            shape=out_shape,
+            test_dtype=dtype,
+            requires_grad=False,
+        )
+
+        # Apply reshape
+        y_ref = x_ref.reshape(out_shape)
+        y_test = x_test.reshape(out_shape)
+        assert tuple(y_test.shape) == tuple(out_shape)
+
+        # Check autograd
+        y_test.backward(dy_test)
+        assert x_test.grad is not None
+        assert tuple(x_test.grad.shape) == tuple(in_shape)
+
+        # Check values
+        tols = dict(rtol=0, atol=0)
+        if isinstance(y_test, QuantizedTensor):
+            y_test = y_test.dequantize()
+        y_test = y_test.to(dtype=torch.float64, device="cpu")
+        dx_test = x_test.grad.to(dtype=torch.float64, device="cpu")
+        dx_ref = dy_ref.reshape(in_shape)
+        torch.testing.assert_close(y_test, y_ref, **tols)
+        torch.testing.assert_close(dx_test, dx_ref, **tols)
+
+    @pytest.mark.parametrize("quantization", _quantization_list)
     def test_cpu_dequantize(
         self,
         *,
