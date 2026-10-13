@@ -554,6 +554,50 @@ class TestCurrentScalingFloat8Tensor:
         with pytest.raises(AssertionError):
             torch.testing.assert_close(x_fp8_dequantized, -x_hp, **_tols[fp8_dtype])
 
+    @pytest.mark.parametrize("fp8_dtype", [te.DType.kFloat8E4M3], ids=str)
+    def test_reshape(self, fp8_dtype: te.DType) -> None:
+        """Check _ReshapeFunc.forward, including cached-transpose handling"""
+
+        device = "cuda"
+        dtype = torch.bfloat16
+        shape = (4, 3, 2)
+
+        # Cast to FP8, keeping a cached (columnwise) transpose around
+        x_hp = 2 * torch.rand(shape, dtype=dtype, device=device) - 1
+        x_hp.requires_grad_()
+        x_fp8 = to_float8_CS(x_hp, fp8_dtype=fp8_dtype, return_transpose=True)
+        assert x_fp8._transpose is not None
+
+        # Reshaping to the same shape should preserve and reshape the cached transpose
+        same_shape_out = x_fp8.reshape(*shape)
+        assert same_shape_out._transpose is not None
+        torch.testing.assert_close(
+            same_shape_out._transpose, x_fp8._transpose, atol=0.0, rtol=0.0
+        )
+        torch.testing.assert_close(same_shape_out._data, x_fp8._data, atol=0.0, rtol=0.0)
+
+        # Reshaping to a genuinely different shape must invalidate the cached
+        # transpose, since it can no longer be reinterpreted in place.
+        new_shape = (2, 3, 4)
+        dy = torch.rand(new_shape, dtype=dtype, device=device)
+        y = x_fp8.reshape(*new_shape)
+        assert y._transpose is None
+        assert y.shape == torch.Size(new_shape)
+
+        # Check dequantized values and scale/dtype metadata are preserved
+        torch.testing.assert_close(
+            y.dequantize(), x_fp8.dequantize().reshape(*new_shape), **_tols[fp8_dtype]
+        )
+        assert y._fp8_dtype == x_fp8._fp8_dtype
+        torch.testing.assert_close(y._scale_inv, x_fp8._scale_inv, atol=0.0, rtol=0.0)
+
+        # Check autograd
+        y.backward(dy)
+        assert x_hp.grad is not None
+        torch.testing.assert_close(
+            x_hp.grad, dy.reshape(*shape).to(dtype), **_tols[fp8_dtype]
+        )
+
 
 class TestQuantizedTensor:
     @staticmethod
