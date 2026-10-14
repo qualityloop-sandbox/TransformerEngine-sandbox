@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import random
+from jax.experimental.custom_partitioning import BATCHING, CompoundFactor, SdyShardingRule
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from distributed_test_base import generate_configs, generate_collectives_count
@@ -20,8 +21,14 @@ from utils import pytest_parametrize_wrapper
 
 from transformer_engine.jax import autocast
 from transformer_engine.common import recipe
+from transformer_engine.jax.cpp_extensions.normalization import NormFwdPrimitive, NVTE_Norm_Type
 from transformer_engine.jax.layernorm import layernorm
-from transformer_engine.jax.quantize import QuantizerFactory, ScalingMode, is_fp8_available
+from transformer_engine.jax.quantize import (
+    QuantizeLayout,
+    QuantizerFactory,
+    ScalingMode,
+    is_fp8_available,
+)
 from transformer_engine.jax.util import get_jnp_float8_e4m3_type, get_jnp_float8_e5m2_type
 
 
@@ -245,3 +252,121 @@ class TestDistributedLayernorm:
                             "RmsNorm primitive did not raise the correct warning for "
                             "unsupported sharding of gamma and/or beta"
                         )
+
+
+class TestNormFwdPrimitiveShardyShardingRule:
+    """Unit tests for NormFwdPrimitive.shardy_sharding_rule.
+
+    These tests call the static method directly with plain Python/JAX values
+    instead of running it through jit + a real mesh, since the rule itself is
+    pure metadata computation that does not touch any device.
+    """
+
+    def _call_rule(self, x_shape, norm_type, scaling_mode, quantize_layout):
+        x_aval = jax.core.ShapedArray(shape=x_shape, dtype=jnp.bfloat16)
+        return NormFwdPrimitive.shardy_sharding_rule(
+            norm_type,
+            False,  # zero_centered_gamma
+            1e-6,  # epsilon
+            jnp.bfloat16,  # out_dtype
+            scaling_mode.value,
+            quantize_layout,
+            jnp.float32,  # scale_dtype
+            None,  # amax_scope
+            False,  # transpose_batch_sequence
+            False,  # output_amax_when_no_scaling
+            False,  # is_outer
+            None,  # mesh
+            [x_aval],  # value_types
+            None,  # result_types
+        )
+
+    @pytest_parametrize_wrapper(
+        "norm_type", [NVTE_Norm_Type.LayerNorm, NVTE_Norm_Type.RMSNorm]
+    )
+    @pytest_parametrize_wrapper("x_shape", [(64, 64), (8, 32, 64)])
+    def test_no_scaling(self, norm_type, x_shape):
+        rule = self._call_rule(
+            x_shape, norm_type, ScalingMode.NO_SCALING, QuantizeLayout.ROWWISE
+        )
+
+        assert isinstance(rule, SdyShardingRule)
+        assert len(rule.operand_mappings) == 5  # x, scale, amax, gamma, beta
+        assert len(rule.result_mappings) == 7  # out, colwise_out, scale_inv x2, amax, mu, rsigma
+
+        x_spec, scale_spec, amax_spec, gamma_spec, beta_spec = rule.operand_mappings
+        (
+            out_spec,
+            colwise_out_spec,
+            rowwise_scale_inv_spec,
+            colwise_scale_inv_spec,
+            result_amax_spec,
+            mu_spec,
+            rsigma_spec,
+        ) = rule.result_mappings
+
+        # No scaling means the output is unquantized and keeps the same spec as the input.
+        assert len(x_spec) == len(x_shape)
+        assert tuple(out_spec) == tuple(x_spec)
+
+        # Scale/amax/gamma/beta are all fully-batched (single factor) dimensions.
+        for spec in (scale_spec, amax_spec, gamma_spec, beta_spec, result_amax_spec):
+            assert len(spec) == 1
+            assert spec[0][0] == BATCHING
+
+        # scale (operand) and rowwise scale_inv (result) refer to the same unsharded factor.
+        assert tuple(scale_spec) == tuple(rowwise_scale_inv_spec)
+        assert len(colwise_out_spec) == 1 and colwise_out_spec[0][0] == BATCHING
+        assert len(colwise_scale_inv_spec) == 1 and colwise_scale_inv_spec[0][0] == BATCHING
+
+        # rsigma matches all but the last (hidden) dim of x.
+        assert tuple(rsigma_spec) == tuple(x_spec[:-1])
+        if norm_type == NVTE_Norm_Type.LayerNorm:
+            # LayerNorm's mu has the same shape/sharding as rsigma.
+            assert tuple(mu_spec) == tuple(rsigma_spec)
+        else:
+            # RMSNorm's mu is a placeholder scalar and is not derived from x.
+            assert len(mu_spec) == 1
+            assert mu_spec[0][0] == BATCHING
+            assert mu_spec[0] != rsigma_spec[0]
+
+        # No scaling mode never needs extra factor sizes (no block/compound factors).
+        assert rule.factor_sizes == {}
+
+    @pytest_parametrize_wrapper(
+        "scaling_mode", [ScalingMode.DELAYED_TENSOR_SCALING, ScalingMode.CURRENT_TENSOR_SCALING]
+    )
+    def test_tensor_scaling_modes(self, scaling_mode):
+        x_shape = (64, 64)
+        rule = self._call_rule(
+            x_shape, NVTE_Norm_Type.LayerNorm, scaling_mode, QuantizeLayout.ROWWISE
+        )
+
+        x_spec = rule.operand_mappings[0]
+        out_spec = rule.result_mappings[0]
+        # Tensor-wide scaling factors keep the quantized output aligned with the input sharding.
+        assert tuple(out_spec) == tuple(x_spec)
+        assert rule.factor_sizes == {}
+
+    def test_mxfp8_block_scaling_uses_compound_factor(self):
+        x_shape = (64, 64)
+        rule = self._call_rule(
+            x_shape,
+            NVTE_Norm_Type.LayerNorm,
+            ScalingMode.MXFP8_1D_SCALING,
+            QuantizeLayout.ROWWISE,
+        )
+
+        x_spec = rule.operand_mappings[0]
+        # The last (block-scaled) dim of x is expressed as a CompoundFactor, not a plain factor,
+        # since it must be split into a "logical size" factor and a "block size" factor.
+        assert isinstance(x_spec[-1], CompoundFactor)
+        assert "blocksize_x" in rule.factor_sizes
+        assert rule.factor_sizes["blocksize_x"] == 32
+
+    def test_requires_jax_0_5(self, monkeypatch):
+        monkeypatch.setattr(jax, "__version__", "0.4.30")
+        with pytest.raises(ImportError):
+            self._call_rule(
+                (64, 64), NVTE_Norm_Type.LayerNorm, ScalingMode.NO_SCALING, QuantizeLayout.ROWWISE
+            )
