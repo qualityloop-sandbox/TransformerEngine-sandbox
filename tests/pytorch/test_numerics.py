@@ -58,6 +58,8 @@ from transformer_engine.pytorch.cpp_extensions import general_gemm
 from transformer_engine.common import recipe
 from transformer_engine.pytorch import DType
 import transformer_engine_torch as tex
+import transformer_engine.pytorch.module.base as te_module_base
+from transformer_engine.pytorch.module.base import fused_ag_gemm_eligible
 from utils import ModelConfig, recipe_id, reset_rng_states, skip_unsupported_backward_override
 
 # Only run FP8 tests on supported devices.
@@ -2866,3 +2868,52 @@ def test_noncontiguous():
     out = _run_module(g2, b)
 
     assert_allclose(out, outT, 1e-7)
+
+
+@pytest.mark.parametrize(
+    "weight_shape, inp_shape, is_dgrad, expected",
+    [
+        ((256, 384), (256, 384), False, True),  # m=256, k=384
+        ((256, 384), (256, 256), True, False),  # dgrad swaps: m=384
+        ((384, 256), (256, 384), True, True),  # dgrad swaps: m=256, k=384
+        ((384, 256), (256, 256), False, False),  # fprop: m=384
+        ((512, 256), (256, 256), False, True),
+        ((256, 128), (256, 128), False, False),  # k < 256
+        ((256, 320), (256, 320), False, False),  # k % 128 != 0
+        ((255, 256), (256, 256), False, False),  # m % 256 != 0
+        ((256, 256), (512, 256), False, True),
+        ((256, 256), (255, 256), False, False),  # n_chunk % 256 != 0
+        ((256, 256), (2, 128, 256), False, True),  # 3D input: n_chunk = 256
+        ((256, 256), (3, 100, 256), False, False),  # 3D input: n_chunk = 300
+    ],
+)
+def test_fused_ag_gemm_eligible_shapes(weight_shape, inp_shape, is_dgrad, expected):
+    name = "test_fused_ag_gemm_eligible"
+    te_module_base._ub_fused_names.add(name)
+    try:
+        weight = torch.empty(weight_shape, dtype=torch.bfloat16, device="meta")
+        inp = torch.empty(inp_shape, dtype=torch.bfloat16, device="meta")
+        kwargs = dict(
+            name=name, inp=inp, weight=weight, bias=None, dtype=torch.bfloat16,
+            tp_size=4, fp8=False, gelu=False, is_dgrad=is_dgrad,
+        )
+        assert fused_ag_gemm_eligible(**kwargs) is expected
+
+        if expected:
+            # Each unsupported feature on its own disqualifies an otherwise valid call.
+            bf16, f32 = torch.bfloat16, torch.float32
+            bad = [
+                dict(fp8=True),
+                dict(gelu=True),
+                dict(bias=torch.empty(8, dtype=bf16, device="meta")),
+                dict(dtype=f32),
+                dict(tp_size=2),
+                dict(tp_size=16),
+            ]
+            for override in bad:
+                assert fused_ag_gemm_eligible(**{**kwargs, **override}) is False, override
+            assert fused_ag_gemm_eligible(**{**kwargs, "tp_size": 8}) is True
+            # Names not using the fused backend are always eligible.
+            assert fused_ag_gemm_eligible(**{**kwargs, "name": name + "_other", "fp8": True}) is True
+    finally:
+        te_module_base._ub_fused_names.discard(name)
